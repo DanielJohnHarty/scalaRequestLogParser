@@ -33,10 +33,15 @@ object RequestLogParser {
                         http:String,
                         datestamp:String,
                       )
-
   val accessLogEncoder = Encoders.product[AccessLog]
 
-  def toAccessLog(params: List[String]): AccessLog =
+
+  def main(args: Array[String]): Unit = {
+    val compressedLogPath = "./src/main/resources/access.log.gz" // Relative from project root
+    createReport(compressedLogPath)
+  }
+
+  private def toAccessLog(params: List[String]): AccessLog =
       AccessLog(params(0),
                 params(1),
                 params(2),
@@ -53,12 +58,7 @@ object RequestLogParser {
                 ""
                 )
 
-  def main(args: Array[String]): Unit = {
-    val compressedLogPath = "./src/main/resources/access.log.gz" // Relative from project root
-    createReport(compressedLogPath)
-  }
-
-  def writeStringToFile(jsonString:String): Unit = {
+  private def writeJsonReportToFile(jsonString:String): Unit = {
     val reportPath = "./jsonReport_"+getCurrentDateStamp()+".json"
     val file = new File(reportPath)
     val bw = new BufferedWriter(new FileWriter(file))
@@ -66,11 +66,11 @@ object RequestLogParser {
     bw.close()
   }
 
-  def getCurrentDateStamp():String = {
+  private def getCurrentDateStamp():String = {
     DateTimeFormatter.ofPattern("yyyyMMdd_HHmm").format(LocalDateTime.now)
   }
 
-  def GetDatesSurpassingAccessThreshold(threshold: Long, ss:SparkSession): Seq[String] = {
+  private def GetDatesSurpassingAccessThreshold(threshold: Long, ss:SparkSession): Seq[String] = {
     val sql: String = s"""select datestamp, count(*) as accessCount from AccessLogExt group by datestamp having count(*) > $threshold order by accessCount desc"""
     ss.sql(sql).as[FilteredDate](filteredDateEncoder)
       .rdd
@@ -79,13 +79,14 @@ object RequestLogParser {
       .toSeq
   }
 
-  def getDateIpJsonReport(datestamp: String, ss: SparkSession): Array[(String, Long)] = {
+  private def getDateIpJsonReport(datestamp: String, ss: SparkSession): Array[(String, Long)] = {
     val sql = s"""select datestamp, ip, ipAccesses from IpAccessData where datestamp = '$datestamp' """
     ss.sql(sql).as[IpReport](ipReportEncoder)
       .rdd.collect
       .map((ip:IpReport)=> (ip.ip -> ip.ipAccesses))
   }
-  def getDateUriJsonReport(datestamp: String, ss: SparkSession): Array[(String, Long)] = {
+
+  private def getDateUriJsonReport(datestamp: String, ss: SparkSession): Array[(String, Long)] = {
     val sql = s"""select datestamp, uri, uriAccesses from UriAccessData where datestamp = '$datestamp' """
     ss.sql(sql).as[UriReport](uriReportEncoder)
       .rdd.collect
@@ -94,48 +95,39 @@ object RequestLogParser {
 
   private def createReport(gzPath: String ): Unit = {
     val ss = getSparkSession()
-
     val dsExtended: Dataset[AccessLog] = getDsExtended(gzPath, ss)
     dsExtended.createOrReplaceTempView("AccessLogExt")
-
     val ipAccessData: DataFrame = {
       val sql: String = "select datestamp, ip, count(ip) as ipAccesses from AccessLogExt group by datestamp, ip"
       ss.sql(sql)
     }
-
     val uriAccessData: DataFrame = {
       val sql: String = "select datestamp, uri, count(uri) as uriAccesses from AccessLogExt group by datestamp, uri"
       ss.sql(sql)
     }
-
     ipAccessData.createOrReplaceTempView("IpAccessData")
     uriAccessData.createOrReplaceTempView("UriAccessData")
-
-    val theDates: Seq[String] = GetDatesSurpassingAccessThreshold(50000, ss)
-
+    val theDates: Seq[String] = GetDatesSurpassingAccessThreshold(20000, ss)
     val reports = theDates.map((datestamp: String) => getDateReport(ss, datestamp))
-
-    writeStringToFile(reports.toJson.toString)
-    println("")
-
+    writeJsonReportToFile(reports.toJson.toString)
     ss.close()
   }
 
-  def getDateReport(ss: SparkSession, datestamp: String): Map[String, (Map[String, Map[String,Long]],Map[String, Map[String,Long]])]= {
+  private def getDateReport(ss: SparkSession, datestamp: String): Map[String, (Map[String, Map[String,Long]],Map[String, Map[String,Long]])]= {
     val ipReport = Map[String, Map[String, Long]]("ipAccessCount" -> getDateIpJsonReport(datestamp, ss).toMap)
     val uriReport = Map[String, Map[String, Long]]("uriAccessCount" -> getDateUriJsonReport(datestamp, ss).toMap)
     val dateReport = Map[String, (Map[String, Map[String, Long]], Map[String, Map[String, Long]])](datestamp -> (ipReport, uriReport))
     return dateReport
   }
 
-  def getDsExtended(gzPath: String, sparkSession: SparkSession) = {
+  private def getDsExtended(gzPath: String, sparkSession: SparkSession) = {
     val ds: Dataset[AccessLog] = generateDatasetOfAccesslogs(gzPath, sparkSession)
     val dsWithTime: Dataset[AccessLog] = addNormalisedDatetime(ds)
     val dsExtended: Dataset[AccessLog] = addRequestComponents(dsWithTime)
     dsExtended
   }
 
-  def addRequestComponents(dsWithTime: Dataset[AccessLog]): Dataset[AccessLog] = {
+  private def addRequestComponents(dsWithTime: Dataset[AccessLog]): Dataset[AccessLog] = {
     // Regex to split the request string into its component parts
     val REQ_EX = "([^ ]+)[ ]+([^ ]+)[ ]+([^ ]+)".r
     // Add columns to the dataset for the individual components of the request string. Drop request string column afterwards.
@@ -146,13 +138,13 @@ object RequestLogParser {
     dsExtended.as[AccessLog](accessLogEncoder)
   }
 
-  def addNormalisedDatetime(ds: Dataset[AccessLog]) = {
+  private def addNormalisedDatetime(ds: Dataset[AccessLog]) = {
     val dsWithTimestamp: DataFrame = ds.withColumn("timestamp", to_timestamp(ds("timestamp"), "dd/MMM/yyyy:HH:mm:ss X"))
     val dsWithTimestampAndDatestamp: DataFrame = dsWithTimestamp.withColumn("datestamp", split(col("timestamp")," ").getItem(0))
     dsWithTimestampAndDatestamp.as[AccessLog](accessLogEncoder)
   }
 
-  def generateDatasetOfAccesslogs(gzPath: String, ss: SparkSession) = {
+  private def generateDatasetOfAccesslogs(gzPath: String, ss: SparkSession) = {
     import ss.implicits._
     val R = """^(?<ip>[0-9.]+) (?<identd>[^ ]) (?<user>[^ ]) \[(?<datetime>[^\]]+)\] \"(?<request>[^\"]*)\" (?<status>[^ ]*) (?<size>[^ ]*) \"(?<referer>[^\"]*)\" \"(?<useragent>[^\"]*)\" \"(?<unk>[^\"]*)\"""".r
     val x: DataFrame = ss.read.text(gzPath) // Read from source
@@ -162,7 +154,7 @@ object RequestLogParser {
     ds
   }
 
-  def getSparkSession(master: String="local[*]"): SparkSession = {
+  private def getSparkSession(master: String="local[*]"): SparkSession = {
     val ss: SparkSession = SparkSession.builder().appName("RequestLogParser")
       .master(master).getOrCreate()
     return ss
